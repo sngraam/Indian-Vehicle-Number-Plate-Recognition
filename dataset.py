@@ -4,9 +4,10 @@ Handles loading images, cropping bounding boxes, and encoding labels
 """
 
 import os
+import random
 import torch
 from torch.utils.data import Dataset
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 import pandas as pd
 import numpy as np
 
@@ -20,7 +21,7 @@ class NumberPlateDataset(Dataset):
         img_00000.jpg,272,306,HP54C6564,105,183,167,197
     """
     
-    def __init__(self, csv_path, img_dir, converter, cfg, transform=None):
+    def __init__(self, csv_path, img_dir, converter, cfg, transform=None, augment=False):
         """
         Args:
             csv_path: Path to CSV file with annotations
@@ -28,12 +29,14 @@ class NumberPlateDataset(Dataset):
             converter: AttnLabelConverter instance for encoding labels
             cfg: Config object with imgH, imgW, batch_max_length
             transform: Optional transforms to apply
+            augment: Whether to apply data augmentation
         """
         self.df = pd.read_csv(csv_path)
         self.img_dir = img_dir
         self.converter = converter
         self.cfg = cfg
         self.transform = transform
+        self.augment = augment
         
         # Filter out labels that are too long
         self.df = self.df[self.df['label'].str.len() <= cfg.batch_max_length].reset_index(drop=True)
@@ -45,10 +48,35 @@ class NumberPlateDataset(Dataset):
         
         self.df = self.df[self.df['label'].apply(is_valid_label)].reset_index(drop=True)
         
-        print(f"Dataset loaded: {len(self.df)} samples after filtering")
+        print(f"Dataset loaded: {len(self.df)} samples after filtering (augment={augment})")
     
     def __len__(self):
         return len(self.df)
+    
+    def apply_augmentation(self, image):
+        """Apply random augmentations to the image."""
+        # Random rotation (-5 to 5 degrees)
+        if random.random() < 0.3:
+            angle = random.uniform(-5, 5)
+            image = image.rotate(angle, fillcolor=128)
+        
+        # Random brightness
+        if random.random() < 0.3:
+            factor = random.uniform(0.7, 1.3)
+            enhancer = ImageEnhance.Brightness(image)
+            image = enhancer.enhance(factor)
+        
+        # Random contrast
+        if random.random() < 0.3:
+            factor = random.uniform(0.8, 1.2)
+            enhancer = ImageEnhance.Contrast(image)
+            image = enhancer.enhance(factor)
+        
+        # Random blur
+        if random.random() < 0.1:
+            image = image.filter(ImageFilter.GaussianBlur(radius=1))
+        
+        return image
     
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
@@ -78,6 +106,10 @@ class NumberPlateDataset(Dataset):
         
         # Resize to model input size
         cropped = cropped.resize((self.cfg.imgW, self.cfg.imgH), Image.BILINEAR)
+        
+        # Apply augmentation if enabled
+        if self.augment:
+            cropped = self.apply_augmentation(cropped)
         
         # Apply transforms if any
         if self.transform:
@@ -141,34 +173,53 @@ def create_dataloaders(cfg, converter):
     Returns:
         train_loader, val_loader
     """
-    from torch.utils.data import DataLoader, random_split
+    from torch.utils.data import DataLoader
     
-    # Create full dataset
-    full_dataset = NumberPlateDataset(
+    img_dir = os.path.join(cfg.data_dir, 'images')
+    
+    # Create train dataset with augmentation
+    train_dataset = NumberPlateDataset(
         csv_path=cfg.csv_path,
-        img_dir=os.path.join(cfg.data_dir, 'images'),
+        img_dir=img_dir,
         converter=converter,
-        cfg=cfg
+        cfg=cfg,
+        augment=True  # Enable augmentation for training
     )
     
-    # Split into train and validation
-    val_size = int(len(full_dataset) * cfg.val_split)
-    train_size = len(full_dataset) - val_size
-    
-    train_dataset, val_dataset = random_split(
-        full_dataset, 
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
+    # Create validation dataset (no augmentation)
+    val_dataset = NumberPlateDataset(
+        csv_path=cfg.csv_path,
+        img_dir=img_dir,
+        converter=converter,
+        cfg=cfg,
+        augment=False
     )
+    
+    # Split indices for train/val
+    total_size = len(train_dataset)
+    indices = list(range(total_size))
+    random.seed(42)
+    random.shuffle(indices)
+    
+    val_size = int(total_size * cfg.val_split)
+    train_size = total_size - val_size
+    
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
     
     print(f"Train size: {train_size}, Val size: {val_size}")
+    
+    # Create subset datasets
+    from torch.utils.data import Subset
+    train_subset = Subset(train_dataset, train_indices)
+    val_subset = Subset(val_dataset, val_indices)
     
     # Create collate function
     collate = AlignCollate(converter, cfg)
     
     # Create dataloaders
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.workers,
@@ -178,7 +229,7 @@ def create_dataloaders(cfg, converter):
     )
     
     val_loader = DataLoader(
-        val_dataset,
+        val_subset,
         batch_size=cfg.batch_size,
         shuffle=False,
         num_workers=cfg.workers,
@@ -188,3 +239,4 @@ def create_dataloaders(cfg, converter):
     )
     
     return train_loader, val_loader
+

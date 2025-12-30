@@ -13,7 +13,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 
 from config import cfg
 from model import Model
@@ -21,7 +21,69 @@ from dataset import create_dataloaders
 from utils import AttnLabelConverter, Averager
 
 
-def train_one_epoch(model, train_loader, criterion, optimizer, converter, cfg, epoch):
+class LabelSmoothingLoss(nn.Module):
+    """
+    Label smoothing loss to prevent overconfident predictions.
+    Helps avoid mode collapse by encouraging diversity.
+    """
+    def __init__(self, num_classes, smoothing=0.1, ignore_index=0):
+        super().__init__()
+        self.smoothing = smoothing
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.confidence = 1.0 - smoothing
+    
+    def forward(self, pred, target):
+        # pred: [N, C], target: [N]
+        pred = pred.log_softmax(dim=-1)
+        
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.num_classes - 2))  # -2 for ignore and true class
+            true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
+            
+            # Mask out ignore_index
+            mask = (target != self.ignore_index).unsqueeze(1)
+            true_dist = true_dist * mask.float()
+        
+        loss = (-true_dist * pred).sum(dim=-1)
+        return loss[target != self.ignore_index].mean()
+
+
+def init_weights(model):
+    """
+    Initialize weights for better convergence.
+    Critical for attention models to avoid mode collapse.
+    """
+    for name, param in model.named_parameters():
+        if 'weight' in name:
+            if 'bn' in name.lower() or 'batch' in name.lower():
+                # BatchNorm: gamma=1, beta=0
+                if 'weight' in name:
+                    nn.init.ones_(param)
+            elif len(param.shape) >= 2:
+                # Linear and Conv layers
+                nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
+        elif 'bias' in name:
+            nn.init.zeros_(param)
+    
+    # Special initialization for LSTM
+    for name, param in model.named_parameters():
+        if 'rnn' in name.lower() or 'lstm' in name.lower():
+            if 'weight_ih' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+                # Set forget gate bias to 1
+                n = param.size(0)
+                param.data[n//4:n//2].fill_(1.0)
+    
+    print("Weights initialized!")
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, converter, cfg, epoch):
     """
     Train for one epoch.
     
@@ -65,20 +127,25 @@ def train_one_epoch(model, train_loader, criterion, optimizer, converter, cfg, e
         
         optimizer.step()
         
+        # Step scheduler per batch for OneCycleLR
+        scheduler.step()
+        
         loss_avg.add(loss)
         
         # Print progress
         if (batch_idx + 1) % cfg.print_interval == 0 or batch_idx == 0:
             elapsed = time.time() - start_time
+            current_lr = scheduler.get_last_lr()[0]
             print(f"  Batch [{batch_idx+1}/{len(train_loader)}] | "
                   f"Loss: {loss.item():.4f} | "
                   f"Avg Loss: {loss_avg.val():.4f} | "
+                  f"LR: {current_lr:.6f} | "
                   f"Time: {elapsed:.1f}s")
     
     return loss_avg.val()
 
 
-def validate(model, val_loader, criterion, converter, cfg):
+def validate(model, val_loader, criterion, converter, cfg, show_samples=False):
     """
     Validate the model.
     
@@ -95,13 +162,15 @@ def validate(model, val_loader, criterion, converter, cfg):
     n_char_correct = 0
     n_char_total = 0
     
+    sample_preds = []  # Store sample predictions for debugging
+    
     with torch.no_grad():
-        for images, text, length in val_loader:
+        for batch_idx, (images, text, length) in enumerate(val_loader):
             images = images.to(cfg.device)
             text = text.to(cfg.device)
             batch_size = images.size(0)
             
-            # Forward pass (inference mode)
+            # Forward pass (inference mode) - don't pass text for true inference
             preds = model(images, text[:, :-1], is_train=False)
             
             # Compute loss
@@ -113,39 +182,52 @@ def validate(model, val_loader, criterion, converter, cfg):
             
             # Get predictions (greedy decoding)
             _, preds_index = preds.max(2)  # [B, max_length+1]
+            preds_index = preds_index.cpu()
             
-            # Decode predictions and targets
-            preds_str = converter.decode(preds_index, length)
-            
-            # Decode targets
-            target_text = []
+            # Decode predictions and targets for this batch
             for i in range(batch_size):
-                t = text[i, 1:]  # Exclude [GO]
-                decoded = ""
-                for idx in t:
-                    if idx.item() == 1:  # [s] token (end)
+                # Decode prediction - stop at [s] token (index 1)
+                pred_chars = []
+                for idx in preds_index[i]:
+                    idx_val = idx.item()
+                    if idx_val == 1:  # [s] end token
                         break
-                    if idx.item() >= 2:  # Skip [GO]=0, [s]=1
-                        decoded += converter.character[idx.item()]
-                target_text.append(decoded)
-            
-            # Calculate accuracy
-            for pred, gt in zip(preds_str, target_text):
-                # Clean prediction (stop at [s])
-                if '[s]' in pred:
-                    pred = pred[:pred.index('[s]')]
-                pred = pred.replace('[GO]', '')
+                    if idx_val >= 2:  # Skip [GO]=0, [s]=1, actual chars start at 2
+                        pred_chars.append(converter.character[idx_val])
+                pred_str = ''.join(pred_chars)
                 
-                if pred == gt:
+                # Decode ground truth
+                gt_chars = []
+                for idx in text[i, 1:]:  # Skip [GO] at position 0
+                    idx_val = idx.item()
+                    if idx_val == 1:  # [s] end token
+                        break
+                    if idx_val >= 2:
+                        gt_chars.append(converter.character[idx_val])
+                gt_str = ''.join(gt_chars)
+                
+                # Store samples for debugging
+                if batch_idx == 0 and i < 5:
+                    sample_preds.append((gt_str, pred_str))
+                
+                # Calculate accuracy
+                if pred_str == gt_str:
                     n_correct += 1
                 n_total += 1
                 
-                # Character accuracy
-                for p_char, g_char in zip(pred, gt):
-                    if p_char == g_char:
+                # Character accuracy (Levenshtein-style)
+                min_len = min(len(pred_str), len(gt_str))
+                for j in range(min_len):
+                    if pred_str[j] == gt_str[j]:
                         n_char_correct += 1
-                    n_char_total += 1
-                n_char_total += abs(len(pred) - len(gt))  # Penalize length mismatch
+                n_char_total += max(len(pred_str), len(gt_str))
+    
+    # Print sample predictions
+    if show_samples and sample_preds:
+        print("\n  Sample Predictions:")
+        for gt, pred in sample_preds:
+            match = "✓" if gt == pred else "✗"
+            print(f"    GT: {gt:12s} | Pred: {pred:12s} {match}")
     
     accuracy = n_correct / max(n_total, 1) * 100
     char_accuracy = n_char_correct / max(n_char_total, 1) * 100
@@ -207,19 +289,35 @@ def main(args):
     print(f"Total parameters: {num_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
-    # Loss function - Cross Entropy
-    # Index 0 is [GO] token which we use for padding, so ignore it
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    # Initialize weights properly
+    init_weights(model)
     
-    # Optimizer
+    # Loss function - Label Smoothing to prevent mode collapse
+    criterion = LabelSmoothingLoss(
+        num_classes=cfg.num_class,
+        smoothing=0.1,
+        ignore_index=0
+    )
+    print(f"Using Label Smoothing Loss (smoothing=0.1)")
+    
+    # Optimizer with lower learning rate
     optimizer = optim.AdamW(
         model.parameters(),
         lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay
+        weight_decay=cfg.weight_decay,
+        betas=(0.9, 0.999)
     )
     
-    # Learning rate scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
+    # OneCycleLR scheduler - better for convergence
+    steps_per_epoch = len(train_loader)
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=cfg.learning_rate,
+        epochs=cfg.epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.1,
+        anneal_strategy='cos'
+    )
     
     # Training loop
     best_accuracy = 0.0
@@ -230,21 +328,19 @@ def main(args):
     print("=" * 60)
     
     for epoch in range(1, cfg.epochs + 1):
-        print(f"\nEpoch [{epoch}/{cfg.epochs}] | LR: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"\nEpoch [{epoch}/{cfg.epochs}]")
         print("-" * 40)
         
-        # Train
+        # Train (scheduler steps inside train_one_epoch)
         train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, converter, cfg, epoch
+            model, train_loader, criterion, optimizer, scheduler, converter, cfg, epoch
         )
         
-        # Validate
+        # Validate (show samples every 5 epochs)
+        show_samples = (epoch % 5 == 0) or (epoch == 1)
         val_loss, accuracy, char_accuracy = validate(
-            model, val_loader, criterion, converter, cfg
+            model, val_loader, criterion, converter, cfg, show_samples=show_samples
         )
-        
-        # Update scheduler
-        scheduler.step()
         
         # Print epoch summary
         print(f"\n  Train Loss: {train_loss:.4f}")
