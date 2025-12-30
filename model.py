@@ -10,6 +10,8 @@ class Model(nn.Module):
 
     def __init__(self, cfg):
         super(Model, self).__init__()
+        self.cfg = cfg  # Store config for forward pass
+        
         """ Transformation """
         
         self.transformation = TPS_SpatialTransformerNetwork(
@@ -24,7 +26,7 @@ class Model(nn.Module):
                 BidirectionalLSTM(self.FeatureExtraction_output, cfg.hidden_size, cfg.hidden_size),
                 BidirectionalLSTM(cfg.hidden_size, cfg.hidden_size, cfg.hidden_size))
 
-        self.SequenceModeling_output = self.FeatureExtraction_output
+        self.SequenceModeling_output = cfg.hidden_size
         self.Prediction = Attention(self.SequenceModeling_output, cfg.hidden_size, cfg.num_class)
 
     def forward(self, input, text, is_train=True):

@@ -1,0 +1,70 @@
+Dataset Information:
+
+Files: 
+Images: 
+
+/kaggle/input/indian-vehicle-number-plate/processed_dataset/images/img_00000.jpg
+/kaggle/input/indian-vehicle-number-plate/processed_dataset/images/img_00001.jpg
+... 
+
+Lables: 
+/kaggle/input/indian-vehicle-number-plate/processed_dataset/labels
+/kaggle/input/indian-vehicle-number-plate/processed_dataset/labels/img_00000.txt
+"""0 0.500000 0.620915 0.227941 0.045752"""
+/kaggle/input/indian-vehicle-number-plate/processed_dataset/labels/img_00001.txt
+
+Json: 
+[
+    {
+        "filename": "img_00000.jpg",
+        "original_path": "/kaggle/input/indian-vehicle-dataset/State-wise_OLX/HP/HP19.jpg",
+        "width": 272,
+        "height": 306,
+        "words": [
+            {
+                "text": "HP54C6564",
+                "xmin": 105,
+                "xmax": 167,
+                "ymin": 183,
+                "ymax": 197
+            }
+        ]
+    },
+    {
+        "filename": "img_00001.jpg",
+        "original_path": "/kaggle/input/indian-vehicle-dataset/State-wise_OLX/HP/HP16.jpg",
+        "width": 272,
+        "height": 204,
+        "words": [
+            {
+                "text": "HP302165",
+                "xmin": 81,
+                "xmax": 131,
+                "ymin": 124,
+                "ymax": 137
+            }
+        ]
+    },
+    {
+        "filename": "img_00002.jpg",
+        "original_path": "/kaggle/input/indian-vehicle-dataset/State-wise_OLX/HP/HP6.jpg",
+        "width": 191,
+        "height": 139,
+        "words": [
+            {
+                "text": "HP01A7630",
+                "xmin": 30,
+                "xmax": 74,
+                "ymin": 97,
+                "ymax": 111
+            }
+        ]
+    },
+
+Train CSV: 
+filename,width,height,label,xmin,ymin,xmax,ymax
+img_00000.jpg,272,306,HP54C6564,105,183,167,197
+img_00001.jpg,272,204,HP302165,81,124,131,137
+img_00002.jpg,191,139,HP01A7630,30,97,74,111
+
+This all traning data to idetified the numberplate Text Recognatzation
